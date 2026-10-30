@@ -1,8 +1,8 @@
+
 import { GoogleGenAI } from "@google/genai";
 import { NextResponse } from "next/server";
 import axios from "axios";
 
-// Use the internal lib path to avoid pdf-parse index.js running test file code on import
 const pdfParse = require("pdf-parse/lib/pdf-parse");
 
 function getConfiguredGeminiClients() {
@@ -15,127 +15,233 @@ function getConfiguredGeminiClients() {
   ];
 
   const apiKeys = rawKeys
-    .flatMap((value) => (value || "").split(",").map((item) => item.trim()).filter(Boolean))
-    .filter((value, index, array) => array.indexOf(value) === index);
+    .flatMap((value) =>
+      (value || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    )
+    .filter((key, index, array) => array.indexOf(key) === index);
 
   return apiKeys.map((apiKey) => new GoogleGenAI({ apiKey }));
 }
 
+function getErrorMessage(error: any): string {
+  const apiMessage = error?.response?.data?.error?.message;
+  const message =
+    apiMessage ||
+    error?.response?.data?.message ||
+    error?.message ||
+    "Unknown provider error";
+
+  return String(message).slice(0, 1000);
+}
+
+async function extractPdfText(pdfBase64: string): Promise<string> {
+  const cleanBase64 = pdfBase64.replace(
+    /^data:application\/pdf;base64,/i,
+    ""
+  );
+
+  const buffer = Buffer.from(cleanBase64, "base64");
+  const data = await pdfParse(buffer);
+  const text = (data.text || "").trim();
+
+  if (!text) {
+    throw new Error(
+      "No selectable text was found. This PDF may be scanned or image-based."
+    );
+  }
+
+  return text;
+}
+
 async function tryGroq(prompt: string, pdfBase64: string | null) {
   const groqApiKey = process.env.GROQ_API_KEY;
-  if (!groqApiKey) throw new Error("Groq API key not configured");
+
+  if (!groqApiKey) {
+    throw new Error("GROQ_API_KEY is not configured.");
+  }
 
   let pdfText = "";
+
   if (pdfBase64) {
     try {
-      const buffer = Buffer.from(pdfBase64, "base64");
-      const data = await pdfParse(buffer);
-      pdfText = data.text || "";
-    } catch (e) {
-      console.error("Failed to parse PDF text:", e);
-      pdfText = "[Unable to extract text from PDF]";
+      pdfText = await extractPdfText(pdfBase64);
+    } catch (error: any) {
+      throw new Error(
+        `Could not extract readable text from the PDF: ${getErrorMessage(error)}`
+      );
     }
   }
 
+  const model = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
+
   const response = await axios.post(
-    "https://api.groq.com/openai/v1/chat/completions",
+    `${process.env.GROQ_BASE_URL || "https://api.groq.com/openai/v1"}/chat/completions`,
     {
-      model: "llama-3.1-8b-instant",
+      model,
       messages: [
-        { role: "system", content: "You are a helpful study assistant. Analyze the provided PDF text and answer the user's question clearly." },
-        { role: "user", content: `PDF Content:\n${pdfText.substring(0, 40000)}\n\nUser Question: ${prompt}` },
+        {
+          role: "system",
+          content:
+            "You are BrainBuddy, a helpful study assistant. Answer questions accurately using the supplied PDF content. Explain difficult topics in simple language. If no PDF content is supplied, answer the user's general question.",
+        },
+        {
+          role: "user",
+          content: `PDF Content:\n${pdfText.slice(0, 40000) || "[No PDF text supplied]"}\n\nUser Question: ${prompt}`,
+        },
       ],
-      temperature: 0.7,
+      temperature: 0.4,
     },
     {
       headers: {
         Authorization: `Bearer ${groqApiKey}`,
         "Content-Type": "application/json",
       },
+      timeout: 60000,
     }
   );
 
   const content = response.data?.choices?.[0]?.message?.content;
-  if (!content) throw new Error("No content received from Groq");
-  return typeof content === "string" ? content : (content || []).join("");
+
+  if (!content) {
+    throw new Error("Groq returned an empty response.");
+  }
+
+  return typeof content === "string"
+    ? content
+    : JSON.stringify(content);
 }
 
 export async function POST(req: Request) {
   try {
-    const { prompt, pdfBase64 } = await req.json();
+    const body = await req.json();
 
-    if (!prompt || typeof prompt !== "string") {
+    const prompt = body?.prompt;
+    let pdfBase64: string | null = body?.pdfBase64 || null;
+
+    if (typeof prompt !== "string" || !prompt.trim()) {
       return NextResponse.json(
-        { answer: "Please provide a question about the PDF." },
+        { answer: "Please enter a question about your PDF." },
         { status: 400 }
       );
     }
 
-    const geminiClients = getConfiguredGeminiClients();
-    const parts: any[] = [
-      { text: `You are a helpful study assistant. Analyze the provided PDF document and answer the user's question clearly.\n\nUser Question: ${prompt}` }
-    ];
-
-    if (pdfBase64) {
-      parts.push({
-        inlineData: {
-          mimeType: "application/pdf",
-          data: pdfBase64
-        }
-      });
+    if (pdfBase64 !== null && typeof pdfBase64 !== "string") {
+      return NextResponse.json(
+        {
+          answer:
+            "The uploaded PDF data is invalid. Please upload it again.",
+        },
+        { status: 400 }
+      );
     }
 
-    const errors: string[] = [];
-    let answer = "";
+    if (pdfBase64) {
+      pdfBase64 = pdfBase64.replace(
+        /^data:application\/pdf;base64,/i,
+        ""
+      );
+    }
 
-    // Try Gemini first
+    const geminiClients = getConfiguredGeminiClients();
+    const errors: string[] = [];
+
+    const model =
+      process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+    // Try Gemini first.
     for (let i = 0; i < geminiClients.length; i++) {
-      const client = geminiClients[i];
       try {
-        const result = await client.models.generateContent({
-          model: "gemini-2.0-flash",
+        const parts: any[] = [
+          {
+            text:
+              "You are BrainBuddy, a helpful study assistant. " +
+              "Answer the user's question clearly, using the supplied PDF when available. " +
+              "Explain difficult concepts in simple language.\n\n" +
+              `User Question: ${prompt.trim()}`,
+          },
+        ];
+
+        if (pdfBase64) {
+          parts.push({
+            inlineData: {
+              mimeType: "application/pdf",
+              data: pdfBase64,
+            },
+          });
+        }
+
+        const result = await geminiClients[i].models.generateContent({
+          model,
           contents: [{ role: "user", parts }],
         });
 
-        answer = result.text || "";
+        const answer = result.text?.trim();
+
         if (answer) {
           return NextResponse.json({ answer });
         }
+
+        errors.push(
+          `Gemini key ${i + 1}: Empty response from ${model}.`
+        );
       } catch (error: any) {
-        console.error(`PDF chat route error with Gemini key ${i}:`, error?.message || error);
-        errors.push(error?.message || "Unknown error");
+        const message = getErrorMessage(error);
+
+        console.error(
+          `PDF Chat Gemini attempt ${i + 1} failed:`,
+          message
+        );
+
+        errors.push(`Gemini key ${i + 1}: ${message}`);
       }
     }
 
-    // Fallback to Groq if all Gemini keys failed or none exist
-    if (!answer && process.env.GROQ_API_KEY) {
+    if (geminiClients.length === 0) {
+      errors.push("No Gemini API key is configured.");
+    }
+
+    // Try Groq if Gemini is unavailable.
+    if (process.env.GROQ_API_KEY) {
       try {
-        console.log("Falling back to Groq for PDF chat...");
-        answer = await tryGroq(prompt, pdfBase64);
+        console.log("PDF Chat: trying Groq fallback.");
+
+        const answer = await tryGroq(prompt.trim(), pdfBase64);
+
         return NextResponse.json({ answer });
-      } catch (groqError: any) {
-        console.error("Groq fallback error:", groqError?.message || groqError);
-        errors.push(`Groq Error: ${groqError?.message}`);
+      } catch (error: any) {
+        const message = getErrorMessage(error);
+
+        console.error("PDF Chat Groq fallback failed:", message);
+        errors.push(`Groq: ${message}`);
       }
+    } else {
+      errors.push("GROQ_API_KEY is not configured.");
     }
 
-    // If everything failed
-    const allErrorsStr = errors.join("; ");
-    let finalError = "The PDF chat backend encountered an error. Details: " + allErrorsStr;
-    const allErrorsStrLower = allErrorsStr.toLowerCase();
-    
-    if (allErrorsStrLower.includes("quota") || allErrorsStrLower.includes("rate limit") || allErrorsStrLower.includes("429")) {
-      finalError = "All AI service keys are currently rate-limited or quota exceeded. Please try again later.";
-    }
+    const details = errors.join(" | ");
+
+    console.error("All PDF Chat providers failed:", details);
 
     return NextResponse.json(
-      { answer: finalError },
-      { status: 500 }
+      {
+        answer:
+          "PDF Chat could not generate an answer. Please check your API configuration and try again.\n\n" +
+          details,
+      },
+      { status: 502 }
     );
   } catch (error: any) {
-    console.error("PDF chat route final error:", error);
+    const details = getErrorMessage(error);
+
+    console.error("PDF Chat route error:", details);
+
     return NextResponse.json(
-      { answer: "The PDF chat backend encountered a critical error. Please try again." },
+      {
+        answer: `PDF Chat request failed: ${details}`,
+      },
       { status: 500 }
     );
   }
